@@ -51,6 +51,7 @@ import coredevices.ring.database.room.RingDatabase
 import coredevices.ring.database.room.SeedDefaultPluginGrants
 import coredevices.ring.database.room.repository.McpServerRepository
 import coredevices.ring.database.room.repository.PluginGrantRepository
+import coredevices.ring.database.room.repository.IndexWebhookDeliveryRoomRepository
 import coredevices.ring.database.room.repository.RecordingProcessingTaskRepository
 import coredevices.ring.database.room.repository.ItemRepository
 import coredevices.ring.database.room.repository.ListRepository
@@ -64,6 +65,8 @@ import coredevices.ring.service.indexfeed.ItemFactory
 import coredevices.libindex.database.repository.RingTransferRepository
 import coredevices.ring.external.indexwebhook.IndexWebhookApi
 import coredevices.ring.external.indexwebhook.IndexWebhookApiImpl
+import coredevices.ring.external.indexwebhook.IndexWebhookDeliveryQueue
+import coredevices.ring.external.indexwebhook.IndexWebhookDeliveryRepository
 import coredevices.ring.external.indexwebhook.IndexWebhookPreferences
 import coredevices.ring.external.indexwebhook.IndexWebhookSigningSecretStorage
 import coredevices.ring.external.indexwebhook.IndexWebhookRunRepository
@@ -175,6 +178,9 @@ val experimentalModule = module {
         get<RingDatabase>().recordingProcessingTaskDao()
     }
     single {
+        get<RingDatabase>().indexWebhookDeliveryDao()
+    }
+    single {
         get<RingDatabase>().traceSessionDao()
     }
     single {
@@ -201,6 +207,7 @@ val experimentalModule = module {
         RingTransferRepository(get(), get<RingDatabase>())
     }
     singleOf(::RecordingProcessingTaskRepository)
+    singleOf(::IndexWebhookDeliveryRoomRepository) bind IndexWebhookDeliveryRepository::class
     single {
         val builtInReminders = get<BuiltInReminderIntegration>()
         ItemRepository(
@@ -249,11 +256,23 @@ val experimentalModule = module {
             get(),
             get(),
             get(),
-            get<RecordingBackgroundScope>()
+            get(),
+            get(),
+            get(),
+            get<RecordingBackgroundScope>(),
         )
     } bind IndexWebhookApi::class
 
     single { RecordingBackgroundScope(CoroutineScope(Dispatchers.IO + SupervisorJob())) }
+    single {
+        val api = get<IndexWebhookApiImpl>()
+        IndexWebhookDeliveryQueue(
+            get(),
+            api::send,
+            get<RecordingBackgroundScope>(),
+            { api.persistPayload(it) },
+        )
+    }
     single { RecordingProcessingQueue(get(), get(), get(), get(), get(), get(), get(), get(), get()) }
     singleOf(::RecordingOperationFactory)
     singleOf(::RealRecordingStorage) bind RecordingStorage::class

@@ -2,50 +2,40 @@ package coredevices.ring.external.indexwebhook
 
 import co.touchlab.kermit.Logger
 import coredevices.api.ApiClient
+import coredevices.indexai.database.dao.LocalRecordingDao
 import coredevices.ring.api.ApiConfig
 import coredevices.ring.audio.M4aEncoder
 import coredevices.ring.service.button.RingGesture
+import coredevices.ring.storage.RecordingStorage
 import io.ktor.client.request.header
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
+import io.ktor.http.HttpHeaders
 import io.ktor.http.content.ByteArrayContent
+import io.ktor.http.fromHttpToGmtDate
 import io.ktor.http.isSuccess
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.io.IOException
+import kotlinx.io.buffered
+import kotlinx.io.readShortLe
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlin.time.Clock
+import kotlin.time.Duration
 import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
 import kotlin.time.TimeSource
 import kotlin.uuid.Uuid
 
 interface IndexWebhookApi {
-    /**
-     * Upload recording data to the webhook configured for [gesture].
-     * Runs asynchronously and does not block the caller.
-     *
-     * @param samples PCM audio samples (16-bit signed, mono). Null when TranscriptionOnly mode.
-     * @param sampleRate Sample rate of the audio in Hz
-     * @param recordingId Unique identifier for the recording (used in filename)
-     * @param transcription Transcription text. Null when RecordingOnly mode.
-     * @param recordedAt When the recording was actually made
-     * @param gesture Button gesture that started the recording
-     */
-    fun uploadIfEnabled(
-        samples: ShortArray?,
-        sampleRate: Int,
-        recordingId: String,
-        transcription: String?,
-        recordedAt: Instant,
-        gesture: RingGesture,
-    )
-
     /** POST a click gesture's button event to its webhook. Runs asynchronously. */
     fun sendButtonEventIfEnabled(gesture: RingGesture, pressedAt: Instant)
 
@@ -66,6 +56,8 @@ data class IndexWebhookRunResult(
     val detail: String,
     val byteSize: Long,
     val durationMs: Long,
+    val retryable: Boolean = false,
+    val retryAfter: Duration? = null,
 )
 
 /** Value of the `X-Index-Trigger` header. Endpoints key off these, do not rename them. */
@@ -94,8 +86,11 @@ class IndexWebhookApiImpl(
     config: ApiConfig,
     private val m4aEncoder: M4aEncoder,
     private val webhookPreferences: IndexWebhookPreferences,
+    private val recordingStorage: RecordingStorage,
+    private val localRecordingDao: LocalRecordingDao,
     private val signingSecretStorage: IndexWebhookSigningSecretStorage,
     private val runRepository: IndexWebhookRunRepository,
+    private val deliveryRepository: IndexWebhookDeliveryRepository,
     private val scope: CoroutineScope,
 ) : IndexWebhookApi, ApiClient(config.version, timeout = 2.minutes, followAllRedirects = true) {
 
@@ -103,63 +98,74 @@ class IndexWebhookApiImpl(
         private val logger = Logger.withTag("IndexWebhookApi")
     }
 
-    override fun uploadIfEnabled(
-        samples: ShortArray?,
-        sampleRate: Int,
-        recordingId: String,
-        transcription: String?,
-        recordedAt: Instant,
-        gesture: RingGesture,
-    ) {
-        val config = webhookPreferences.configFor(gesture)
-        val url = config.url
-        if (!config.isActive || url == null) return
-
-        scope.launch {
-            try {
-                logger.d { "Webhook upload for $recordingId (${gesture.name})" }
-
-                // The caller already selected the payload for the delivery's mode.
-                val m4aData: ByteArray? = samples?.let { m4aEncoder.encode(it, sampleRate) }
-
-                val boundary = Uuid.random().toString()
-                val result = post(
-                    url = url,
-                    headers = config.headers,
-                    signRequests = config.signRequests,
-                    signingSecret = signingSecretFor(gesture, config),
-                    deliveryId = recordingId,
-                    triggerValue = gesture.webhookTriggerValue,
-                    bodyBytes = buildWebhookMultipartBody(
-                        boundary = boundary,
-                        audioData = m4aData,
-                        filename = "$recordingId.m4a",
-                        recordedAt = recordedAt.toEpochMilliseconds(),
-                        transcription = transcription,
-                        isTest = false,
-                    ),
-                    contentType = multipartType(boundary),
-                    audioSize = m4aData?.size,
+    suspend fun send(delivery: IndexWebhookDelivery): IndexWebhookRunResult {
+        val started = TimeSource.Monotonic.markNow()
+        val result = try {
+            val prepared = persistPayload(delivery)
+            val boundary = Uuid.random().toString()
+            post(
+                url = prepared.url,
+                headers = prepared.headers,
+                signRequests = prepared.signRequests,
+                signingSecret = signingSecretFor(prepared.gesture, prepared.signRequests),
+                deliveryId = prepared.deliveryId,
+                triggerValue = prepared.gesture.webhookTriggerValue,
+                bodyBytes = buildWebhookMultipartBody(
+                    boundary = boundary,
+                    audioData = prepared.audioData,
+                    filename = "${prepared.deliveryId}.m4a",
+                    recordedAt = checkNotNull(prepared.recordedAt).toEpochMilliseconds(),
+                    transcription = prepared.transcription,
                     isTest = false,
-                    okDetail = contentsLabel(m4aData != null, transcription != null),
-                )
-                runRepository.record(
-                    gesture = gesture,
-                    ok = result.ok,
-                    status = result.status,
-                    detail = result.detail,
-                    byteSize = result.byteSize,
-                    durationMs = result.durationMs,
-                )
-                if (result.ok) {
-                    logger.i { "Webhook upload succeeded for $recordingId" }
-                } else {
-                    logger.e { "Webhook upload failed for $recordingId: ${result.status} ${result.detail}" }
-                }
-            } catch (e: Exception) {
-                logger.e(e) { "Error during webhook upload for $recordingId" }
-            }
+                ),
+                contentType = multipartType(boundary),
+                audioSize = prepared.audioData?.size,
+                isTest = false,
+                okDetail = contentsLabel(prepared.audioData != null, prepared.transcription != null),
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logger.e(e) { "Failed to persist webhook payload" }
+            IndexWebhookRunResult(
+                ok = false,
+                status = "FAILED",
+                detail = e.message ?: "unknown error",
+                byteSize = 0,
+                durationMs = started.elapsedNow().inWholeMilliseconds,
+                retryable = e.isRetryableWebhookFailure(),
+            )
         }
+        runRepository.record(
+            gesture = delivery.gesture,
+            ok = result.ok,
+            status = result.status,
+            detail = result.detail,
+            byteSize = result.byteSize,
+            durationMs = result.durationMs,
+            deliveryId = delivery.deliveryId,
+            canRetry = result.shouldOfferManualRetry(delivery.attempts),
+        )
+        return result
+    }
+
+    suspend fun persistPayload(delivery: IndexWebhookDelivery): IndexWebhookDelivery {
+        if (delivery.recordedAt != null && (delivery.fileId == null || delivery.audioData != null)) return delivery
+        val recordedAt = delivery.recordedAt
+            ?: localRecordingDao.getRecording(delivery.recordingId)?.localTimestamp
+            ?: delivery.created
+        val audioData = delivery.audioData ?: delivery.fileId?.let { encodeAudio(it) }
+        deliveryRepository.setPayload(delivery.id, audioData, recordedAt)
+        return delivery.copy(audioData = audioData, recordedAt = recordedAt)
+    }
+
+    private suspend fun encodeAudio(fileId: String): ByteArray {
+        val (source, meta) = recordingStorage.openRecordingSource(fileId)
+        val samples = ShortArray((meta.size / 2).toInt())
+        source.buffered().use {
+            for (i in samples.indices) samples[i] = it.readShortLe()
+        }
+        return m4aEncoder.encode(samples, meta.cachedMetadata.sampleRate)
     }
 
     override fun sendButtonEventIfEnabled(gesture: RingGesture, pressedAt: Instant) {
@@ -173,7 +179,7 @@ class IndexWebhookApiImpl(
                     url = url,
                     headers = config.headers,
                     signRequests = config.signRequests,
-                    signingSecret = signingSecretFor(gesture, config),
+                    signingSecret = signingSecretFor(gesture, config.signRequests),
                     deliveryId = Uuid.random().toString(),
                     triggerValue = gesture.webhookTriggerValue,
                     bodyBytes = buildButtonEventBody(gesture, config.clickPayload, pressedAt, isTest = false),
@@ -244,8 +250,8 @@ class IndexWebhookApiImpl(
         return result
     }
 
-    private suspend fun signingSecretFor(gesture: RingGesture, config: IndexWebhookConfig): String? =
-        if (config.signRequests) {
+    private suspend fun signingSecretFor(gesture: RingGesture, signRequests: Boolean): String? =
+        if (signRequests) {
             try {
                 signingSecretStorage.get(gesture)
             } catch (e: Exception) {
@@ -295,11 +301,11 @@ class IndexWebhookApiImpl(
                 header(WEBHOOK_VERSION_HEADER, WEBHOOK_VERSION)
                 header(WEBHOOK_TRIGGER_HEADER, triggerValue)
                 if (isTest) header(WEBHOOK_TEST_HEADER, "true")
+                if (!isTest || signature != null) header(WEBHOOK_DELIVERY_HEADER, deliveryId)
                 if (audioSize != null) header(WEBHOOK_AUDIO_SIZE_HEADER, audioSize.toString())
                 if (signature != null) {
                     header(WEBHOOK_SIGNATURE_HEADER, signature)
                     header(WEBHOOK_TIMESTAMP_HEADER, timestamp.toString())
-                    header(WEBHOOK_DELIVERY_HEADER, deliveryId)
                 }
                 setBody(
                     ByteArrayContent(bytes = bodyBytes, contentType = contentType)
@@ -321,8 +327,12 @@ class IndexWebhookApiImpl(
                     detail = response.bodyAsText().take(200).ifBlank { response.status.description },
                     byteSize = bodyBytes.size.toLong(),
                     durationMs = elapsed,
+                    retryable = response.status.value.isRetryableWebhookStatus(),
+                    retryAfter = response.headers[HttpHeaders.RetryAfter].toRetryAfterDuration(),
                 )
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             logger.e(e) { "Failed to post to webhook" }
             IndexWebhookRunResult(
@@ -331,9 +341,27 @@ class IndexWebhookApiImpl(
                 detail = e.message ?: "unknown error",
                 byteSize = bodyBytes.size.toLong(),
                 durationMs = started.elapsedNow().inWholeMilliseconds,
+                retryable = e.isRetryableWebhookFailure(),
             )
         }
     }
+}
+
+internal fun Int.isRetryableWebhookStatus(): Boolean =
+    this == 408 || this == 425 || this == 429 || this in 500..599
+
+internal fun Throwable.isRetryableWebhookFailure(): Boolean = this is IOException
+
+internal fun IndexWebhookRunResult.shouldOfferManualRetry(attempts: Int): Boolean =
+    !ok && (!retryable || attempts + 1 >= MAX_WEBHOOK_DELIVERY_ATTEMPTS)
+
+internal fun String?.toRetryAfterDuration(now: Instant = Clock.System.now()): Duration? {
+    val value = this?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    value.toLongOrNull()?.takeIf { it >= 0 }?.let { return it.seconds }
+    return runCatching {
+        (Instant.fromEpochMilliseconds(value.fromHttpToGmtDate().timestamp) - now)
+            .coerceAtLeast(Duration.ZERO)
+    }.getOrNull()
 }
 
 private fun multipartType(boundary: String) =

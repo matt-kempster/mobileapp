@@ -17,6 +17,7 @@ import coredevices.ring.bugreport.RingRssiStatistics
 import coredevices.ring.database.Preferences
 import coredevices.ring.database.room.repository.RecordingRepository
 import coredevices.ring.service.IndexNotificationManager
+import coredevices.ring.external.indexwebhook.IndexWebhookDeliveryQueue
 import coredevices.ring.service.RingSync
 import coredevices.ring.storage.RecordingStorage
 import coredevices.util.Permission
@@ -69,10 +70,12 @@ class ExperimentalDevices(
     private val targetCalendarSeeder: TargetCalendarSeeder,
     private val indexNotificationManager: IndexNotificationManager,
     private val libPebble: LibPebble,
+    private val indexWebhookDeliveryQueue: IndexWebhookDeliveryQueue,
 ) {
     private val scope = CoroutineScope(Dispatchers.Default)
     fun appInit() {
         ringDelegate.appInit()
+        indexWebhookDeliveryQueue.resumePendingDeliveries()
         libIndex.init(
             permissionRequester.missingPermissions.distinctUntilChanged { old, new ->
                 (Permission.Bluetooth in old && Permission.Bluetooth !in new) || (Permission.Bluetooth !in old && Permission.Bluetooth in new)

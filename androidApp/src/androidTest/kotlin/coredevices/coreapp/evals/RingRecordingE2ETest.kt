@@ -662,14 +662,6 @@ class RingRecordingE2ETest {
         // Webhook (disabled)
         single {
             object : IndexWebhookApi {
-                override fun uploadIfEnabled(
-                    samples: ShortArray?,
-                    sampleRate: Int,
-                    recordingId: String,
-                    transcription: String?,
-                    recordedAt: Instant,
-                    gesture: coredevices.ring.service.button.RingGesture,
-                ) {}
                 override fun sendButtonEventIfEnabled(gesture: RingGesture, pressedAt: Instant) = Unit
 
                 override suspend fun sendTestEvent(
