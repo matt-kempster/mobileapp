@@ -13,6 +13,7 @@ import coredevices.ring.storage.RecordingStorage
 import coredevices.ring.storage.StagedRecordingUpload
 import coredevices.util.queue.RecoverableTaskException
 import coredevices.util.queue.TaskStatus
+import io.ktor.http.HttpStatusCode
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.flow.first
@@ -102,8 +103,12 @@ class IndexWebhookDeliveryQueueTest {
 
     @Test
     fun onlyTransientStatusesAreRetryable() {
-        listOf(408, 429, 500, 502, 503, 504).forEach { assertTrue(it.isRetryableWebhookStatus(), "$it") }
-        listOf(400, 401, 403, 404, 409, 413, 422).forEach { assertFalse(it.isRetryableWebhookStatus(), "$it") }
+        listOf(408, 429, 500, 502, 503, 504).forEach {
+            assertTrue(HttpStatusCode.fromValue(it).isRetryableWebhookStatus(), "$it")
+        }
+        listOf(400, 401, 403, 404, 409, 413, 422).forEach {
+            assertFalse(HttpStatusCode.fromValue(it).isRetryableWebhookStatus(), "$it")
+        }
     }
 
     private fun result(ok: Boolean, retryable: Boolean = false) = IndexWebhookRunResult(

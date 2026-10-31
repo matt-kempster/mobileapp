@@ -10,6 +10,7 @@ import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
+import io.ktor.http.HttpStatusCode
 import io.ktor.http.content.ByteArrayContent
 import io.ktor.http.isSuccess
 import kotlinx.coroutines.CoroutineScope
@@ -311,7 +312,7 @@ class IndexWebhookApiImpl(
                     detail = response.bodyAsText().take(200).ifBlank { response.status.description },
                     byteSize = bodyBytes.size.toLong(),
                     durationMs = elapsed,
-                    retryable = response.status.value.isRetryableWebhookStatus(),
+                    retryable = response.status.isRetryableWebhookStatus(),
                 )
             }
         } catch (e: Exception) {
@@ -328,7 +329,8 @@ class IndexWebhookApiImpl(
     }
 }
 
-internal fun Int.isRetryableWebhookStatus(): Boolean = this == 408 || this == 429 || this in 500..599
+internal fun HttpStatusCode.isRetryableWebhookStatus(): Boolean =
+    this == HttpStatusCode.RequestTimeout || this == HttpStatusCode.TooManyRequests || value in 500..599
 
 private fun multipartType(boundary: String) =
     ContentType.parse("multipart/form-data; boundary=$boundary")
