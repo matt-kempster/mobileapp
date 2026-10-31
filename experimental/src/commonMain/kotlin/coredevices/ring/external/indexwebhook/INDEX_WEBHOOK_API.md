@@ -120,7 +120,7 @@ Receivers should:
 3. Reject unsupported webhook versions and malformed timestamps.
 4. Reconstruct the signed bytes and compare signatures in constant time.
 5. Reject timestamps outside a short window; five minutes is a reasonable default.
-6. Cache accepted delivery IDs for at least that window, and answer a repeated ID with a 2xx without processing it again: the app retries a delivery whose response it didn't receive.
+6. Cache accepted delivery IDs for at least that window, and answer a repeated ID with a 2xx without processing it again. The app retries any delivery for which it did not receive a response.
 
 Use a unique, cryptographically random secret for each endpoint. At least 32 random bytes encoded as base64url or hex is recommended. Do not use a memorable password or reuse an API token.
 
