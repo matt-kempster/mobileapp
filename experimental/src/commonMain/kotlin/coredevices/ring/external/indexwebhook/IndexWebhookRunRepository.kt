@@ -22,8 +22,6 @@ data class IndexWebhookRun(
     val detail: String,
     val byteSize: Long,
     val durationMs: Long,
-    /** Set on a recording delivery that failed for good, so the run offers Retry. */
-    val retryDeliveryId: String? = null,
 ) {
     val timestamp: Instant get() = Instant.fromEpochMilliseconds(timestampMs)
 }
@@ -57,7 +55,6 @@ class IndexWebhookRunRepository(private val settings: Settings) {
         detail: String,
         byteSize: Long,
         durationMs: Long,
-        retryDeliveryId: String? = null,
         timestamp: Instant = Clock.System.now(),
     ) {
         val run = IndexWebhookRun(
@@ -67,18 +64,10 @@ class IndexWebhookRunRepository(private val settings: Settings) {
             detail = detail,
             byteSize = byteSize,
             durationMs = durationMs,
-            retryDeliveryId = retryDeliveryId,
         )
         mutex.withLock {
             update(gesture, listOf(run) + _runs.value[gesture].orEmpty())
         }
-    }
-
-    /** Hides Retry once it was tapped; the retried attempt records its own run. */
-    suspend fun clearRetry(gesture: RingGesture, deliveryId: String) = mutex.withLock {
-        update(gesture, _runs.value[gesture].orEmpty().map {
-            if (it.retryDeliveryId == deliveryId) it.copy(retryDeliveryId = null) else it
-        })
     }
 
     private fun update(gesture: RingGesture, runs: List<IndexWebhookRun>) {

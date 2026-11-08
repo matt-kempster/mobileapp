@@ -17,7 +17,16 @@ import io.ktor.http.HttpStatusCode
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.io.Buffer
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -25,17 +34,28 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlin.test.AfterTest
 import kotlin.time.Instant
+import kotlin.time.Duration.Companion.seconds
 
 class IndexWebhookDeliveryQueueTest {
 
     private val created = Instant.fromEpochMilliseconds(1_700_000_000_000)
 
-    private fun delivery(fileId: String? = null, transcription: String? = "hello") = IndexWebhookDeliveryEntity(
+    private fun delivery(
+        fileId: String? = null,
+        transcription: String? = "hello",
+        deliveryId: String = fileId ?: "text-7",
+        status: TaskStatus = TaskStatus.Pending,
+        attempts: Int = 0,
+        gesture: RingGesture = RingGesture.Hold,
+    ) = IndexWebhookDeliveryEntity(
         id = 1,
         created = created,
-        deliveryId = fileId ?: "text-7",
-        gesture = RingGesture.Hold,
+        attempts = attempts,
+        status = status,
+        deliveryId = deliveryId,
+        gesture = gesture,
         recordingId = 7,
         fileId = fileId,
         transcription = transcription,
@@ -44,6 +64,16 @@ class IndexWebhookDeliveryQueueTest {
     private val runRepository = IndexWebhookRunRepository(MapSettings())
 
     private fun TestScope.queue(api: FakeWebhookApi) = testDeliveryQueue(backgroundScope, api, runRepository)
+
+    /** The scheduler sends on Dispatchers.IO, so tests that run it end to end wait in real time. */
+    private val realScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
+    @AfterTest
+    fun tearDown() = realScope.cancel()
+
+    private suspend fun awaitUntil(condition: suspend () -> Boolean) = withContext(Dispatchers.Default) {
+        withTimeout(5.seconds) { while (!condition()) delay(10) }
+    }
 
     @Test
     fun sendsTheQueuedPayload() = runTest {
@@ -80,18 +110,26 @@ class IndexWebhookDeliveryQueueTest {
     }
 
     @Test
-    fun runOffersRetryOnlyOnceTheDeliveryFailedForGood() = runTest {
-        val retryable = FakeWebhookApi(result(ok = false, retryable = true))
-        assertFailsWith<RecoverableTaskException> { queue(retryable).processTask(delivery()) }
-        assertNull(runRepository.runs(RingGesture.Hold).first().single().retryDeliveryId)
+    fun sendNowGivesEveryUndeliveredRecordingAFreshRoundAndSendsIt() = runTest {
+        val dao = FakeWebhookDeliveryDao()
+        val gaveUp = dao.add(
+            delivery(deliveryId = "gave-up", status = TaskStatus.Failed, attempts = IndexWebhookDeliveryQueue.MAX_ATTEMPTS)
+        )
+        val interrupted = dao.add(delivery(deliveryId = "interrupted", status = TaskStatus.Failed, attempts = 1))
+        val waiting = dao.add(delivery(deliveryId = "waiting", status = TaskStatus.Pending, attempts = 3))
+        val delivered = dao.add(delivery(deliveryId = "delivered", status = TaskStatus.Success, attempts = 1))
+        val otherGesture = dao.add(delivery(deliveryId = "other", status = TaskStatus.Failed, gesture = RingGesture.ClickHold))
+        val api = FakeWebhookApi(result(ok = true))
+        val queue = testDeliveryQueue(realScope, api, runRepository, dao)
 
-        val lastAttempt = delivery().copy(attempts = IndexWebhookDeliveryQueue.MAX_ATTEMPTS - 1)
-        assertFailsWith<RecoverableTaskException> { queue(retryable).processTask(lastAttempt) }
-        assertEquals("text-7", runRepository.runs(RingGesture.Hold).first().first().retryDeliveryId)
+        assertEquals(listOf(gaveUp, interrupted, waiting), queue.undeliveredIds(RingGesture.Hold).first())
+        queue.sendNow(RingGesture.Hold)
+        awaitUntil { queue.undeliveredIds(RingGesture.Hold).first().isEmpty() }
 
-        val permanent = FakeWebhookApi(result(ok = false, retryable = false))
-        assertFailsWith<IllegalStateException> { queue(permanent).processTask(delivery(fileId = "rec-2")) }
-        assertEquals("rec-2", runRepository.runs(RingGesture.Hold).first().first().retryDeliveryId)
+        assertEquals(listOf("gave-up", "interrupted", "waiting"), api.calls.map { it.recordingId })
+        listOf(gaveUp, interrupted, waiting).forEach { assertEquals(1, dao.tasks.getValue(it).attempts) }
+        assertEquals(TaskStatus.Success, dao.tasks.getValue(delivered).status)
+        assertEquals(TaskStatus.Failed, dao.tasks.getValue(otherGesture).status)
     }
 
     @Test
@@ -171,22 +209,53 @@ private class FakeWebhookApi(private val result: IndexWebhookRunResult?) : Index
     ) = throw NotImplementedError("unused")
 }
 
+/** Keeps deliveries in memory, so the queue can run against it end to end. */
 internal class FakeWebhookDeliveryDao : IndexWebhookDeliveryDao {
-    val resetFailedIds = mutableListOf<String>()
+    private val state = MutableStateFlow<Map<Long, IndexWebhookDeliveryEntity>>(emptyMap())
+    val tasks: Map<Long, IndexWebhookDeliveryEntity> get() = state.value
+    private var nextId = 1L
 
-    override suspend fun resetFailed(deliveryId: String): Int {
-        resetFailedIds += deliveryId
-        return 0
+    fun add(task: IndexWebhookDeliveryEntity): Long {
+        val id = nextId++
+        state.update { it + (id to task.copy(id = id)) }
+        return id
     }
 
-    override suspend fun getIdByDeliveryId(deliveryId: String): Long? = TODO()
-    override suspend fun insertTask(task: IndexWebhookDeliveryEntity): Long = TODO()
-    override suspend fun getPendingTasks(): List<IndexWebhookDeliveryEntity> = emptyList()
-    override suspend fun updateTaskStatus(taskId: Long, status: TaskStatus) = TODO()
-    override suspend fun deleteTask(taskId: Long) = TODO()
+    private fun change(taskId: Long, transform: (IndexWebhookDeliveryEntity) -> IndexWebhookDeliveryEntity) =
+        state.update { tasks -> tasks[taskId]?.let { tasks + (taskId to transform(it)) } ?: tasks }
+
+    override suspend fun insertTask(task: IndexWebhookDeliveryEntity): Long =
+        if (tasks.values.any { it.deliveryId == task.deliveryId }) -1 else add(task)
+
+    override suspend fun getPendingTasks() =
+        tasks.values.filter { it.status == TaskStatus.Pending }.sortedBy { it.created }
+
+    override suspend fun updateTaskStatus(taskId: Long, status: TaskStatus) = change(taskId) { it.copy(status = status) }
+
+    override suspend fun deleteTask(taskId: Long) = state.update { it - taskId }
+
     override suspend fun deleteCompletedTasksAttemptedBefore(before: Instant) = TODO()
-    override suspend fun getTaskById(taskId: Long): IndexWebhookDeliveryEntity? = TODO()
-    override suspend fun incrementAttempts(taskId: Long, currentTime: Instant) = TODO()
+
+    override suspend fun getTaskById(taskId: Long) = tasks[taskId]
+
+    override suspend fun incrementAttempts(taskId: Long, currentTime: Instant) =
+        change(taskId) { it.copy(attempts = it.attempts + 1, lastAttempt = currentTime) }
+
+    override fun undeliveredIds(gesture: RingGesture) = state.map { tasks ->
+        tasks.values.filter { it.gesture == gesture && it.status != TaskStatus.Success }.map { it.id }
+    }
+
+    override suspend fun resetUndelivered(gesture: RingGesture) {
+        state.update { tasks ->
+            tasks.mapValues { (_, task) ->
+                if (task.gesture == gesture && task.status != TaskStatus.Success) {
+                    task.copy(status = TaskStatus.Pending, attempts = 0)
+                } else {
+                    task
+                }
+            }
+        }
+    }
 }
 
 private object FakeLocalRecordingDao : LocalRecordingDao {

@@ -2,22 +2,27 @@ package coredevices.ring.external.indexwebhook
 
 import com.russhwolf.settings.MapSettings
 import coredevices.ring.service.button.RingGesture
+import coredevices.ring.data.entity.room.IndexWebhookDeliveryEntity
 import coredevices.util.integrations.IntegrationTokenStorage
+import coredevices.util.queue.TaskStatus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.Instant
+import kotlin.time.Duration.Companion.seconds
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class IndexWebhookSettingsViewModelTest {
@@ -149,28 +154,40 @@ class IndexWebhookSettingsViewModelTest {
     }
 
     @Test
-    fun retryHidesTheButtonAndRequeuesTheDelivery() = runTest {
+    fun countsUndeliveredRecordingsAndSendsThemNow() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         Dispatchers.setMain(dispatcher)
         try {
             val fixture = Fixture(backgroundScope)
-            fixture.runRepository.record(
+            fun delivery(id: String, status: TaskStatus) = IndexWebhookDeliveryEntity(
+                status = status,
+                deliveryId = id,
                 gesture = RingGesture.Hold,
-                ok = false,
-                status = "404 ERROR",
-                detail = "Not Found",
-                byteSize = 0,
-                durationMs = 0,
-                retryDeliveryId = "rec-1",
+                recordingId = 1,
+                fileId = null,
+                transcription = null,
             )
+            fixture.deliveryDao.add(delivery("failed", TaskStatus.Failed))
+            fixture.deliveryDao.add(delivery("waiting", TaskStatus.Pending))
+            fixture.deliveryDao.add(delivery("delivered", TaskStatus.Success))
+
             fixture.viewModel.openDialog(RingGesture.Hold)
             advanceUntilIdle()
+            assertEquals(2, fixture.viewModel.undelivered.value)
 
-            fixture.viewModel.retry(fixture.runRepository.runs(RingGesture.Hold).first().single())
+            fixture.viewModel.sendUndelivered()
             advanceUntilIdle()
-
-            assertEquals(listOf("rec-1"), fixture.deliveryDao.resetFailedIds)
-            assertNull(fixture.runRepository.runs(RingGesture.Hold).first().single().retryDeliveryId)
+            // The queue sends on Dispatchers.IO; wait for it, and let it finish before Main is reset.
+            withContext(Dispatchers.Default) {
+                withTimeout(5.seconds) {
+                    while (
+                        fixture.deliveryDao.tasks.values.any { it.status != TaskStatus.Success } ||
+                        fixture.deliveryQueue.activeTaskIds.value.isNotEmpty()
+                    ) delay(10)
+                }
+            }
+            advanceUntilIdle()
+            assertEquals(0, fixture.viewModel.undelivered.value)
         } finally {
             Dispatchers.resetMain()
         }
@@ -184,12 +201,13 @@ class IndexWebhookSettingsViewModelTest {
         val api = FakeWebhookApi()
         val runRepository = IndexWebhookRunRepository(settings)
         val deliveryDao = FakeWebhookDeliveryDao()
+        val deliveryQueue = testDeliveryQueue(scope, dao = deliveryDao)
         val viewModel = IndexWebhookSettingsViewModel(
             preferences,
             api,
             runRepository,
             secretStorage,
-            testDeliveryQueue(scope, dao = deliveryDao),
+            deliveryQueue,
         )
     }
 

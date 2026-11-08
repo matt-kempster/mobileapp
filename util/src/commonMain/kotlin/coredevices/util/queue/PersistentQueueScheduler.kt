@@ -5,8 +5,10 @@ import com.russhwolf.settings.Settings
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
@@ -15,6 +17,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.flatMapMerge
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.getAndUpdate
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
@@ -39,6 +42,10 @@ abstract class PersistentQueueScheduler<T : QueueTask>(
     private var scheduledTaskBefore = false
     private val _activeTaskIds = MutableStateFlow<Set<Long>>(emptySet())
     val activeTaskIds = _activeTaskIds.asStateFlow()
+
+    /** Delayed retries not yet due, so scheduling a task sooner can replace its wait. */
+    private val waitingRetries = MutableStateFlow<Map<Long, Job>>(emptyMap())
+    internal val waitingRetryIds: Set<Long> get() = waitingRetries.value.keys
 
     private val inProgressKey = "queue_${label}_in_progress"
     private val inProgressLock = Mutex()
@@ -76,10 +83,15 @@ abstract class PersistentQueueScheduler<T : QueueTask>(
                     repository.updateStatus(id, TaskStatus.Failed)
                 } else {
                     logger.e(e) { "Error processing task, will retry later: ${e.message}" }
-                    scope.launch {
+                    val retry = scope.launch(start = CoroutineStart.LAZY) {
                         delay(rescheduleDelay)
-                        scheduleTask(id)
+                        val self = coroutineContext[Job]
+                        // Whichever of this and scheduleTask takes the entry out sends the task.
+                        val waiting = waitingRetries.getAndUpdate { if (it[id] === self) it - id else it }
+                        if (waiting[id] === self) queueActor.trySend(id)
                     }
+                    waitingRetries.update { it + (id to retry) }
+                    retry.start()
                 }
             } finally {
                 _activeTaskIds.update { it - id }
@@ -128,8 +140,10 @@ abstract class PersistentQueueScheduler<T : QueueTask>(
         }
     }
 
+    /** Queues the task to run as soon as the queue is free, replacing any delayed retry it was waiting on. */
     protected fun scheduleTask(id: Long) {
         scheduledTaskBefore = true
+        waitingRetries.getAndUpdate { it - id }[id]?.cancel()
         logger.d { "Scheduling task with id $id" }
         queueActor.trySend(id)
     }
