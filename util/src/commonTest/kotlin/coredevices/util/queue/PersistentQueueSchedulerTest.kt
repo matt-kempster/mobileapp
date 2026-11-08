@@ -66,8 +66,17 @@ private class TestScheduler(
     repository: FakeRepository,
     scope: CoroutineScope,
     settings: MapSettings,
+    failInterruptedTasks: Boolean = true,
     private val onProcess: suspend (FakeTask) -> Unit = {},
-) : PersistentQueueScheduler<FakeTask>(repository, scope, settings, "test", rescheduleDelay = 1.minutes) {
+) : PersistentQueueScheduler<FakeTask>(
+    repository,
+    scope,
+    settings,
+    "test",
+    rescheduleDelay = 1.minutes,
+    maxAttempts = 3,
+    failInterruptedTasks = failInterruptedTasks,
+) {
     val processed = mutableListOf<Long>()
 
     override suspend fun processTask(task: FakeTask) {
@@ -140,5 +149,30 @@ class PersistentQueueSchedulerTest {
         withContext(Dispatchers.Default) {
             withTimeout(5.seconds) { while (settings.getStringOrNull(IN_PROGRESS_KEY) != "$id") delay(10) }
         }
+    }
+
+    @Test
+    fun interruptedTaskIsResumedWhenTheQueueAllowsIt() = runTest {
+        val interrupted = repository.insertTask(FakeTask(attempts = 1))
+        settings.putString(IN_PROGRESS_KEY, "$interrupted")
+        val scheduler = TestScheduler(repository, scope, settings, failInterruptedTasks = false)
+
+        scheduler.resumePendingTasks()
+        awaitTask(interrupted) { it.status == TaskStatus.Success }
+
+        assertEquals(listOf(interrupted), scheduler.processed)
+        assertFalse(settings.hasKey(IN_PROGRESS_KEY))
+    }
+
+    @Test
+    fun resumedTaskThatKeepsGettingInterruptedStopsAtMaxAttempts() = runTest {
+        val interrupted = repository.insertTask(FakeTask(attempts = 3))
+        settings.putString(IN_PROGRESS_KEY, "$interrupted")
+        val scheduler = TestScheduler(repository, scope, settings, failInterruptedTasks = false)
+
+        scheduler.resumePendingTasks()
+        awaitTask(interrupted) { it.status == TaskStatus.Failed }
+
+        assertEquals(emptyList<Long>(), scheduler.processed)
     }
 }

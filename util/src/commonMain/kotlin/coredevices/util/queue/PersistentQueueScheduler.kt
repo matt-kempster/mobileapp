@@ -33,6 +33,13 @@ abstract class PersistentQueueScheduler<T : QueueTask>(
     private val rescheduleDelay: Duration = 1.minutes,
     private val maxAttempts: Int = 3,
     private val maxConcurrency: Int = 1,
+    /**
+     * Whether a task that was mid-attempt when the process died is failed at the next launch
+     * (in case that attempt is what crashed the app) instead of resumed. A queue whose attempts
+     * are safe to repeat and whose process is often killed mid-attempt can resume them; the
+     * attempt was already counted, so a task that does crash the app still stops at [maxAttempts].
+     */
+    private val failInterruptedTasks: Boolean = true,
 ): AutoCloseable {
     private val logger = Logger.withTag("Queue-$label")
     private val queueActor = Channel<Long>(Channel.UNLIMITED)
@@ -107,7 +114,7 @@ abstract class PersistentQueueScheduler<T : QueueTask>(
     /**
      * Call this on app startup to resume any pending tasks that were not completed in the previous session.
      * A task still recorded as in-progress was mid-attempt when the process died (possibly the cause of a
-     * crash), so it is failed rather than resumed to avoid a crash loop.
+     * crash), so unless [failInterruptedTasks] is off it is failed rather than resumed to avoid a crash loop.
      */
     fun resumePendingTasks() {
         if (scheduledTaskBefore) {
@@ -118,7 +125,8 @@ abstract class PersistentQueueScheduler<T : QueueTask>(
         val interruptedIds = readInProgressIds()
         settings.remove(inProgressKey)
         scope.launch {
-            val (interrupted, resumable) = repository.getPendingTasks().partition { it.id in interruptedIds }
+            val (interrupted, resumable) = repository.getPendingTasks()
+                .partition { failInterruptedTasks && it.id in interruptedIds }
             interrupted.forEach {
                 logger.e { "Task with id ${it.id} was in progress when the app last stopped, marking as failed" }
                 repository.updateStatus(it.id, TaskStatus.Failed)
