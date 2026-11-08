@@ -2,8 +2,11 @@ package coredevices.ring.database.room.repository
 
 import coredevices.ring.data.entity.room.IndexWebhookDeliveryEntity
 import coredevices.ring.database.room.dao.IndexWebhookDeliveryDao
+import coredevices.ring.service.button.RingGesture
 import coredevices.util.queue.QueueTaskRepository
 import coredevices.util.queue.TaskStatus
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlin.time.Instant
 
 class IndexWebhookDeliveryRepository(
@@ -27,7 +30,11 @@ class IndexWebhookDeliveryRepository(
     override suspend fun incrementAttempts(taskId: Long, currentTime: Instant) =
         dao.incrementAttempts(taskId, currentTime)
 
-    /** The delivery's task id, if it had failed and is now pending again. */
-    suspend fun resetFailed(deliveryId: String): Long? =
-        if (dao.resetFailed(deliveryId) > 0) dao.getIdByDeliveryId(deliveryId) else null
+    fun undeliveredIds(gesture: RingGesture): Flow<List<Long>> = dao.undeliveredIds(gesture)
+
+    /** Puts every undelivered delivery back to pending with no attempts used; returns their task ids. */
+    suspend fun resetUndelivered(gesture: RingGesture): List<Long> {
+        dao.resetUndelivered(gesture)
+        return dao.undeliveredIds(gesture).first()
+    }
 }

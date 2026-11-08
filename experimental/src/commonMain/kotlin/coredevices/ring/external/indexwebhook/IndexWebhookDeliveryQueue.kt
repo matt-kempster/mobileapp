@@ -5,9 +5,11 @@ import coredevices.indexai.database.dao.LocalRecordingDao
 import coredevices.ring.data.entity.room.IndexWebhookDeliveryEntity
 import coredevices.ring.database.room.repository.IndexWebhookDeliveryRepository
 import coredevices.ring.service.RecordingBackgroundScope
+import coredevices.ring.service.button.RingGesture
 import coredevices.ring.storage.RecordingStorage
 import coredevices.util.queue.PersistentQueueScheduler
 import coredevices.util.queue.RecoverableTaskException
+import kotlinx.coroutines.flow.Flow
 import kotlinx.io.buffered
 import kotlinx.io.readShortLe
 import kotlin.time.Duration
@@ -44,9 +46,12 @@ class IndexWebhookDeliveryQueue(
         if (id != -1L) scheduleTask(id)
     }
 
-    /** Gives a delivery that failed for good another round of attempts. */
-    suspend fun retry(deliveryId: String) {
-        repository.resetFailed(deliveryId)?.let { scheduleTask(it) }
+    /** Ids of [gesture]'s deliveries that haven't gone through: failed, or waiting for another attempt. */
+    fun undeliveredIds(gesture: RingGesture): Flow<List<Long>> = repository.undeliveredIds(gesture)
+
+    /** Sends [gesture]'s undelivered recordings now, each with a fresh round of attempts. */
+    suspend fun sendNow(gesture: RingGesture) {
+        repository.resetUndelivered(gesture).forEach { scheduleTask(it) }
     }
 
     override suspend fun processTask(task: IndexWebhookDeliveryEntity) {
@@ -60,8 +65,6 @@ class IndexWebhookDeliveryQueue(
             recordedAt = recordedAt,
             gesture = task.gesture,
         ) ?: return
-        // The scheduler counts this attempt before running it.
-        val failedForGood = !result.ok && (!result.retryable || task.attempts + 1 >= MAX_ATTEMPTS)
         runRepository.record(
             gesture = task.gesture,
             ok = result.ok,
@@ -69,7 +72,6 @@ class IndexWebhookDeliveryQueue(
             detail = result.detail,
             byteSize = result.byteSize,
             durationMs = result.durationMs,
-            retryDeliveryId = task.deliveryId.takeIf { failedForGood },
         )
         when {
             result.ok -> Unit

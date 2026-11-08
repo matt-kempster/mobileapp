@@ -5,7 +5,9 @@ import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import coredevices.ring.data.entity.room.IndexWebhookDeliveryEntity
+import coredevices.ring.service.button.RingGesture
 import coredevices.util.queue.TaskStatus
+import kotlinx.coroutines.flow.Flow
 import kotlin.time.Instant
 
 @Dao
@@ -32,9 +34,9 @@ interface IndexWebhookDeliveryDao {
     @Query("UPDATE IndexWebhookDeliveryEntity SET attempts = attempts + 1, lastAttempt = :currentTime WHERE id = :taskId")
     suspend fun incrementAttempts(taskId: Long, currentTime: Instant)
 
-    @Query("UPDATE IndexWebhookDeliveryEntity SET status = 'Pending', attempts = 0 WHERE deliveryId = :deliveryId AND status = 'Failed'")
-    suspend fun resetFailed(deliveryId: String): Int
+    @Query("SELECT id FROM IndexWebhookDeliveryEntity WHERE gesture = :gesture AND status != 'Success'")
+    fun undeliveredIds(gesture: RingGesture): Flow<List<Long>>
 
-    @Query("SELECT id FROM IndexWebhookDeliveryEntity WHERE deliveryId = :deliveryId")
-    suspend fun getIdByDeliveryId(deliveryId: String): Long?
+    @Query("UPDATE IndexWebhookDeliveryEntity SET status = 'Pending', attempts = 0 WHERE gesture = :gesture AND status != 'Success'")
+    suspend fun resetUndelivered(gesture: RingGesture)
 }

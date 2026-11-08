@@ -80,6 +80,7 @@ fun IndexWebhookSheet(
     val copyable by viewModel.copyableGesture.collectAsState()
     val canRemove by viewModel.canRemove.collectAsState()
     val runs by viewModel.runs.collectAsState()
+    val undelivered by viewModel.undelivered.collectAsState()
     val focusManager = LocalFocusManager.current
     val dismissKeyboard = KeyboardActions(onDone = { focusManager.clearFocus() })
     val colors = IndexTheme.colors
@@ -358,6 +359,10 @@ fun IndexWebhookSheet(
 
             Column {
                 SectionLabel("Recent runs", Modifier.padding(bottom = 4.dp))
+                if (undelivered > 0) {
+                    UndeliveredRow(undelivered, onSendNow = viewModel::sendUndelivered)
+                    HorizontalDivider(color = colors.outlineVariant)
+                }
                 if (runs.isEmpty()) {
                     Text(
                         if (isClick) "No runs yet. They'll show up here after your first click."
@@ -368,7 +373,7 @@ fun IndexWebhookSheet(
                     )
                 }
                 runs.forEach { run ->
-                    RunRow(run, onRetry = { viewModel.retry(run) })
+                    RunRow(run)
                     HorizontalDivider(color = colors.outlineVariant)
                 }
             }
@@ -377,7 +382,33 @@ fun IndexWebhookSheet(
 }
 
 @Composable
-private fun RunRow(run: IndexWebhookRun, onRetry: () -> Unit) {
+private fun UndeliveredRow(count: Int, onSendNow: () -> Unit) {
+    val colors = IndexTheme.colors
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+    ) {
+        Icon(
+            Icons.Default.Error,
+            contentDescription = null,
+            tint = colors.error,
+            modifier = Modifier.size(16.dp),
+        )
+        Text(
+            if (count == 1) "1 recording not delivered" else "$count recordings not delivered",
+            style = MaterialTheme.typography.bodySmall,
+            color = colors.onSurfaceVariant,
+            modifier = Modifier.weight(1f),
+        )
+        TextButton(onClick = onSendNow, contentPadding = PaddingValues(horizontal = 4.dp)) {
+            Text("Send now")
+        }
+    }
+}
+
+@Composable
+private fun RunRow(run: IndexWebhookRun) {
     val colors = IndexTheme.colors
     val color =
         if (run.ok) colors.onSurfaceVariant else colors.error
@@ -414,11 +445,6 @@ private fun RunRow(run: IndexWebhookRun, onRetry: () -> Unit) {
             color = colors.outline,
             maxLines = 1,
         )
-        if (run.retryDeliveryId != null) {
-            TextButton(onClick = onRetry, contentPadding = PaddingValues(horizontal = 4.dp)) {
-                Text("Retry")
-            }
-        }
     }
 }
 

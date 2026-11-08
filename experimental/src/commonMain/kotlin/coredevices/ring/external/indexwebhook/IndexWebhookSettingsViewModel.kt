@@ -82,6 +82,20 @@ class IndexWebhookSettingsViewModel(
         }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList<IndexWebhookRun>())
 
+    /**
+     * The open gesture's recordings that haven't reached its webhook: given up on, or waiting for
+     * their next attempt. One being sent right now isn't counted.
+     */
+    val undelivered = _gesture
+        .flatMapLatest { gesture ->
+            gesture?.let {
+                combine(deliveryQueue.undeliveredIds(it), deliveryQueue.activeTaskIds) { ids, sending ->
+                    ids.count { id -> id !in sending }
+                }
+            } ?: flowOf(0)
+        }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, 0)
+
     /** Another gesture of the same kind with a saved webhook worth copying. */
     val copyableGesture = combine(_gesture, webhookPreferences.configs) { gesture, configs ->
         gesture?.let { open ->
@@ -192,13 +206,10 @@ class IndexWebhookSettingsViewModel(
         }
     }
 
-    fun retry(run: IndexWebhookRun) {
+    /** Sends the open gesture's undelivered recordings now. */
+    fun sendUndelivered() {
         val gesture = _gesture.value ?: return
-        val deliveryId = run.retryDeliveryId ?: return
-        viewModelScope.launch {
-            runRepository.clearRetry(gesture, deliveryId)
-            deliveryQueue.retry(deliveryId)
-        }
+        viewModelScope.launch { deliveryQueue.sendNow(gesture) }
     }
 
     fun save() {

@@ -110,6 +110,24 @@ class PersistentQueueSchedulerTest {
     }
 
     @Test
+    fun schedulingATaskReplacesTheRetryItWasWaitingFor() = runTest {
+        val id = repository.insertTask(FakeTask())
+        val scheduler = TestScheduler(repository, scope, settings) {
+            if (it.attempts == 0) throw RecoverableTaskException("boom")
+        }
+
+        scheduler.schedule(id)
+        withContext(Dispatchers.Default) {
+            withTimeout(5.seconds) { while (id !in scheduler.waitingRetryIds) delay(10) }
+        }
+        scheduler.schedule(id)
+        awaitTask(id) { it.status == TaskStatus.Success }
+
+        assertEquals(listOf(id, id), scheduler.processed)
+        assertFalse(id in scheduler.waitingRetryIds)
+    }
+
+    @Test
     fun inProgressClearedAfterRecoverableFailure() = runTest {
         val id = repository.insertTask(FakeTask())
         val scheduler = TestScheduler(repository, scope, settings) { throw RecoverableTaskException("boom") }
