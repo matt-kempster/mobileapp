@@ -33,6 +33,9 @@ class IndexWebhookDeliveryQueue(
     label = "IndexWebhookDelivery",
     rescheduleDelay = rescheduleDelay,
     maxAttempts = MAX_ATTEMPTS,
+    // iOS often ends the app while a delivery waits on the network (#336), and failing those for
+    // good loses the recording. Sending one again is safe: receivers dedupe on X-Index-Delivery.
+    failInterruptedTasks = false,
 ) {
     companion object {
         const val MAX_ATTEMPTS = 10
