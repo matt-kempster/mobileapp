@@ -79,10 +79,10 @@ suspend fun SemanticResult.actionText(): String {
         is SemanticResult.AlarmCreation -> getString(Res.string.alarm_set)
         is SemanticResult.TimerCreation -> getString(Res.string.timer_started)
         is SemanticResult.TaskCreation -> getString(Res.string.reminder_added)
-        is SemanticResult.ListItemCreation -> if (this.listUsed != null) {
-            getString(Res.string.noted_to_list, this.listUsed!!)
-        } else {
-            getString(Res.string.noted)
+        is SemanticResult.ListItemCreation -> when {
+            this.destination != null -> "Sent to ${this.destination}"
+            this.listUsed != null -> getString(Res.string.noted_to_list, this.listUsed!!)
+            else -> getString(Res.string.noted)
         }
         is SemanticResult.SupportingData -> "Gathered info"
         is SemanticResult.ActionLogged -> this.title

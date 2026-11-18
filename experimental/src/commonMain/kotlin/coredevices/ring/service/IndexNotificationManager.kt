@@ -22,6 +22,7 @@ import coredevices.ring.data.NoteShortcutType
 import coredevices.ring.data.entity.room.TraceEventData
 import coredevices.ring.database.Preferences
 import coredevices.ring.database.room.repository.RecordingRepository
+import coredevices.ring.service.recordings.button.isOnlyWebhookDelivery
 import coredevices.ring.ui.UITimeUtil
 import coredevices.ring.ui.components.chat.actionText
 import coredevices.ring.ui.navigation.RingRoutes
@@ -318,6 +319,11 @@ class IndexNotificationManager(
                         logger.d { "(Job ID ${currentCoroutineContext()[Job]?.hashCode()?.toHexString()}) Handling notification for transfer ${transfer.id}: $notification" }
                         val notif = when (notification) {
                             is InflightIndexNotification.Discarded -> null
+                            is InflightIndexNotification.AgentComplete if (
+                                !prefs.debugDetailsEnabled.value &&
+                                    notification.answer == null &&
+                                    notification.actionsTaken.isOnlyWebhookDelivery()
+                            ) -> null
                             is InflightIndexNotification.Transferring -> {
                                 GenericNotification(
                                     id = notification.id,

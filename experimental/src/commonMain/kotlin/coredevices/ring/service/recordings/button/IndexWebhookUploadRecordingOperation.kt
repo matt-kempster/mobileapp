@@ -157,7 +157,7 @@ class WebhookOnlyRecordingOperation(
             text = text,
             toolCallId = Uuid.random().toString(),
             result = if (error == null) {
-                ToolCallResult("Sent to webhook", SemanticResult.ListItemCreation(text, destination = "webhook"))
+                ToolCallResult("Sent to webhook", SemanticResult.ListItemCreation(text, destination = WEBHOOK_ONLY_DESTINATION))
             } else {
                 ToolCallResult(error, SemanticResult.GenericFailure(userErrorMessage = error))
             },
@@ -197,3 +197,13 @@ internal fun webhookDeliveryError(outcome: IndexWebhookDeliveryOutcome?): String
         else -> "Webhook failed (${result.status})"
     }
 }
+
+/** The destination a successful webhook-only delivery records on its feed entry. */
+internal const val WEBHOOK_ONLY_DESTINATION = "webhook"
+
+/**
+ * True when every action is a successful webhook-only delivery. The press stays in the feed, but it
+ * gets no action notification: nothing ran on the phone, and before entries were kept it had none.
+ */
+internal fun List<SemanticResult>.isOnlyWebhookDelivery(): Boolean =
+    isNotEmpty() && all { it is SemanticResult.ListItemCreation && it.destination == WEBHOOK_ONLY_DESTINATION }
